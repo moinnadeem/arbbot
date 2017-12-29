@@ -8,6 +8,8 @@ class Bittrex extends Exchange {
   //
   const PUBLIC_URL = 'https://bittrex.com/api/v1.1/public/';
 
+  private $fullOrderHistory = null;
+
   function __construct() {
     parent::__construct( Config::get( "bittrex.key" ), Config::get( "bittrex.secret" ) );
 
@@ -19,8 +21,7 @@ class Bittrex extends Exchange {
   }
 
   public function deductFeeFromAmountBuy( $amount ) {
-
-    return parent::deductFeeFromAmountBuy( $amount );
+    return $amount * 0.9975;
 
   }
 
@@ -115,6 +116,152 @@ class Bittrex extends Exchange {
     return null;
   }
 
+  public function queryTradeHistory( $options = array( ), $recentOnly = false ) {
+    $results = array( );
+
+    $type_map = array(
+      'LIMIT_BUY' => 'buy',
+      'LIMIT_SELL' => 'sell',
+    );
+
+    if (!$recentOnly && $this->fullOrderHistory !== null) {
+      $results = $this->fullOrderHistory;
+    } else if (!$recentOnly && !$this->fullOrderHistory &&
+               file_exists( __DIR__ . '/../../bittrex-fullOrders.csv' )) {
+      $file = file_get_contents( __DIR__ . '/../../bittrex-fullOrders.csv' );
+      $file = iconv( 'utf-16', 'utf-8', $file );
+      $lines = explode( "\r\n", $file );
+      $first = true;
+      foreach ($lines as $line) {
+        if ($first) {
+          // Ignore the first line.
+          $first = false;
+          continue;
+        }
+        $data = str_getcsv( $line );
+        if (count( $data ) != 9) {
+          continue;
+        }
+	$market = $data[ 1 ];
+	$arr = explode( '-', $market );
+	$currency = $arr[ 0 ];
+	$tradeable = $arr[ 1 ];
+	$market = "${currency}_${tradeable}";
+	$amount = $data[ 3 ];
+	$feeFactor = ($data[ 2 ] == 'LIMIT_SELL') ? -1 : 1;
+	$results[ $market ][] = array(
+	  'rawID' => $data[ 0 ],
+	  'id' => $data[ 0 ],
+	  'currency' => $currency,
+	  'tradeable' => $tradeable,
+	  'type' => $type_map[ $data[ 2 ] ],
+	  'time' => strtotime( $data[ 7 ] ),
+	  'rate' => $data[ 6 ] / $amount,
+	  'amount' => $amount,
+	  'fee' => $feeFactor * $data[ 5 ],
+	  'total' => $data[ 6 ],
+	);
+      }
+      $this->fullOrderHistory = $results;
+    }
+
+    $result = $this->queryAPI( 'account/getorderhistory' );
+
+    $checkArray = !empty( $results );
+
+    foreach ($result as $row) {
+      $market = $row[ 'Exchange' ];
+      $arr = explode( '-', $market );
+      $currency = $arr[ 0 ];
+      $tradeable = $arr[ 1 ];
+      $market = "${currency}_${tradeable}";
+      if (!in_array( $market, array_keys( $results ) )) {
+        $results[ $market ] = array();
+      }
+      $amount = $row[ 'Quantity' ] - $row[ 'QuantityRemaining' ];
+      $feeFactor = ($row[ 'OrderType' ] == 'LIMIT_SELL') ? -1 : 1;
+
+      if ($checkArray) {
+        $seen = false;
+        foreach ($results[ $market ] as $item) {
+          if ($item[ 'rawID' ] == $row[ 'OrderUuid' ]) {
+            // We have already recorder this ID.
+            $seen = true;
+            break;
+          }
+        }
+        if ($seen) {
+          continue;
+        }
+      }
+
+      $results[ $market ][] = array(
+        'rawID' => $row[ 'OrderUuid' ],
+        'id' => $row[ 'OrderUuid' ],
+        'currency' => $currency,
+        'tradeable' => $tradeable,
+        'type' => $type_map[ $row[ 'OrderType' ] ],
+        'time' => strtotime( $row[ 'TimeStamp' ] ),
+        'rate' => $row[ 'PricePerUnit' ],
+        'amount' => $amount,
+        'fee' => $feeFactor * $row[ 'Commission' ],
+        'total' => $row[ 'Price' ],
+      );
+    }
+
+    foreach ( array_keys( $results ) as $market ) {
+      usort( $results[ $market ], 'compareByTime' );
+    }
+
+    return $results;
+  }
+
+  public function queryRecentDeposits( $currency = null ) {
+
+    $history = $this->queryAPI( 'account/getdeposithistory',
+                                $currency ? array ( 'currency' => $currency ) : array( ) );
+
+    $result = array();
+    foreach ( $history as $row ) {
+      $result[] = array(
+        'currency' => $row[ 'Currency' ],
+        'amount' => $row[ 'Amount' ],
+        'txid' => $row[ 'TxId' ],
+        'address' => $row[ 'CryptoAddress' ],
+        'time' => strtotime( $row[ 'LastUpdated' ] ),
+        'pending' => ( $row[ 'Confirmations' ] < $this->getConfirmationTime( $row[ 'Currency' ] ) ),
+      );
+    }
+
+    usort( $result, 'compareByTime' );
+
+    return $result;
+
+  }
+
+  public function queryRecentWithdrawals( $currency = null ) {
+
+    $history = $this->queryAPI( 'account/getwithdrawalhistory',
+                                $currency ? array ( 'currency' => $currency ) : array( ) );
+
+    $result = array();
+    foreach ( $history as $row ) {
+      $result[] = array(
+        'currency' => $row[ 'Currency' ],
+        'amount' => $row[ 'Amount' ],
+        'txid' => $row[ 'TxId' ],
+        'address' => $row[ 'Address' ],
+        'time' => strtotime( $row[ 'Opened' ] ),
+        'pending' => $row[ 'PendingPayment' ] === true,
+      );
+    }
+
+    usort( $result, 'compareByTime' );
+
+    return $result;
+
+  }
+
   protected function fetchOrderbook( $tradeable, $currency ) {
 
     $orderbook = $this->queryOrderbook( $tradeable, $currency );
@@ -148,7 +295,6 @@ class Bittrex extends Exchange {
 
   public function cancelOrder( $orderID ) {
 
-    logg( $this->prefix() . "Cancelling order $orderID" );
     try {
       $this->queryCancelOrder( $orderID );
       return true;
@@ -324,6 +470,12 @@ class Bittrex extends Exchange {
 
   }
 
+  public function getTradeHistoryCSVName() {
+
+    return "bittrex-fullOrders.csv";
+
+  }
+
   // Internal functions for querying the exchange
 
   private function queryDepositAddress( $coin ) {
@@ -465,10 +617,23 @@ class Bittrex extends Exchange {
           throw new Exception( "HTTP ${code} received from server" );
         }
         //
+
+	if ( $data === false ) {
+	  $error = $this->prefix() . "Could not get reply: " . curl_error( $ch );
+	  logg( $error );
+	  continue;
+	}
+
+	return $this->xtractResponse( $data );
       }
       catch ( Exception $ex ) {
         $error = $ex->getMessage();
         logg( $this->prefix() . $error );
+
+        if ( strpos( $error, 'ORDER_NOT_OPEN' ) !== false ) {
+          // Real error, don't attempt to retry needlessly.
+          break;
+        }
 
         // Refresh request parameters
         $nonce = $this->nonce();
@@ -479,14 +644,6 @@ class Bittrex extends Exchange {
         curl_setopt( $ch, CURLOPT_HTTPHEADER, ["apisign: $sign" ] );
         continue;
       }
-
-      if ( $data === false ) {
-        $error = $this->prefix() . "Could not get reply: " . curl_error( $ch );
-        logg( $error );
-        continue;
-      }
-
-      return $this->xtractResponse( $data );
     }
     throw new Exception( $error );
 

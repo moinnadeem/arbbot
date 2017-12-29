@@ -30,7 +30,7 @@ class CoinManager {
   private $exchangesID = [ ];
 
   function __construct( $exchanges ) {
-    $this->exchanges = $exchanges;
+    $this->exchanges = &$exchanges;
 
     foreach ( $exchanges as $exchange ) {
       $this->exchangesID[ $exchange->getID() ] = $exchange;
@@ -38,7 +38,7 @@ class CoinManager {
 
   }
 
-  public function doManage() {
+  public function doManage( &$arbitrator ) {
 
     logg( "doManage()" );
     $this->stats = Database::getStats();
@@ -53,7 +53,7 @@ class CoinManager {
       if ( $stats[ self::STAT_NEXT_MANAGEMENT ] <= time() ) {
         //
         $stats[ self::STAT_NEXT_MANAGEMENT ] = time() + Config::get( Config::INTERVAL_MANAGEMENT, Config::DEFAULT_INTERVAL_MANAGEMENT ) * 1800;
-        self::manageWallets();
+        self::manageWallets( $arbitrator );
         //
       }
       else if ( $stats[ self::STAT_NEXT_TAKE_PROFIT ] <= time() ) {
@@ -473,7 +473,10 @@ class CoinManager {
 
     $profit = formatBTC( $totalBTC - $profitLimit );
     logg( "Profit: " . $profit );
-    $restockCash = formatBTC( min( 0.1, $profit * 0.33 ) );
+    $restockCash = formatBTC( min( Config::get( Config::TAKE_PROFIT_MIN_RESTOCK_CASH,
+                                                Config::DEFAULT_TAKE_PROFIT_MIN_RESTOCK_CASH ),
+                                   $profit * Config::get( Config::TAKE_PROFIT_RESTOCK_CASH_PERCENTAGE,
+                                                          Config::DEFAULT_TAKE_PROFIT_RESTOCK_CASH_PERCENTAGE ) ) );
 
     $minXFER = Config::get( Config::MIN_BTC_XFER, Config::DEFAULT_MIN_BTC_XFER );
     // Be a bit more conservative with BTC, since it's our profits after all!
@@ -490,23 +493,25 @@ class CoinManager {
       return;
     }
 
-    // -------------------------------------------------------------------------
-    $restockFunds = $this->stats[ self::STAT_AUTOBUY_FUNDS ];
-    logg( "Overwriting restock funds..." );
-    logg( "Restock cash before: $restockFunds BTC" );
-    $this->stats[ self::STAT_AUTOBUY_FUNDS ] = $restockCash;
-    logg( " Restock cash after: $restockCash BTC" );
-    logg( "   Remaining profit: $remainingProfit BTC" );
-    // -------------------------------------------------------------------------
-
     logg( "Withdrawing profit: $remainingProfit BTC to $profitAddress", true );
     if ( $highestExchange->withdraw( 'BTC', $remainingProfit, $profitAddress ) ) {
+      $txFee = $this->getSafeTxFee( $highestExchange, 'BTC', $averageBTC );
+      Database::recordProfit( $remainingProfit - $txFee, 'BTC', $profitAddress, time() );
       Database::saveWithdrawal( 'BTC', $remainingProfit, $profitAddress, $highestExchange->getID(), 0 );
+
+      // -------------------------------------------------------------------------
+      $restockFunds = $this->stats[ self::STAT_AUTOBUY_FUNDS ];
+      logg( "Overwriting restock funds..." );
+      logg( "Restock cash before: $restockFunds BTC" );
+      $this->stats[ self::STAT_AUTOBUY_FUNDS ] = $restockCash;
+      logg( " Restock cash after: $restockCash BTC" );
+      logg( "   Remaining profit: $remainingProfit BTC" );
+      // -------------------------------------------------------------------------
     }
 
   }
 
-  private function autobuyAltcoins() {
+  private function autobuyAltcoins( &$arbitrator ) {
 
     if ( !Config::get( Config::MODULE_AUTOBUY, Config::DEFAULT_MODULE_AUTOBUY ) ) {
       return;
@@ -584,6 +589,7 @@ class CoinManager {
         continue;
       }
 
+      $tradeableBefore = $exchange->getWallets()[ $coin ];
       logg( "Posting buy order to " . $exchange->getName() . ": $buyAmount $coin for $buyPrice @ $rate" );
       $orderID = $exchange->buy( $coin, 'BTC', $rate, $buyAmount );
       if ( !is_null( $orderID ) ) {
@@ -595,6 +601,9 @@ class CoinManager {
           logg( "Order executed!" );
           Database::saveManagement( $coin, $buyAmount, $rate, $exchange->getID() );
           $this->stats[ self::STAT_AUTOBUY_FUNDS ] = formatBTC( $autobuyFunds - $buyPrice );
+
+          $arbitrator->getTradeMatcher()->handlePostTradeTasks( $arbitrator, $exchange, $coin, 'BTC', 'buy',
+                                                                $orderID, $buyAmount );
           return;
         }
       }
@@ -602,19 +611,19 @@ class CoinManager {
 
   }
 
-  private function manageWallets() {
+  private function manageWallets( &$arbitrator ) {
 
     logg( "manageWallets()" );
 
     self::saveSnapshot();
 
-    self::autobuyAltcoins();
+    self::autobuyAltcoins( $arbitrator );
 
     self::balanceCurrencies();
 
     self::balanceAltcoins();
 
-    self::liquidateAltcoins();
+    self::liquidateAltcoins( $arbitrator );
 
   }
 
@@ -642,7 +651,7 @@ class CoinManager {
 
   }
 
-  private function liquidateAltcoins() {
+  private function liquidateAltcoins( &$arbitrator ) {
     logg( "liquidateAltcoins()" );
 
     if ( !Config::get( Config::MODULE_LIQUIDATE, Config::DEFAULT_MODULE_LIQUIDATE ) ) {
@@ -728,6 +737,7 @@ class CoinManager {
         continue;
       }
 
+      $tradeableBefore = $exchange->getWallets()[ $coin ];
       logg( "Posting sell order to " . $exchange->getName() . ": $sellAmount $coin for $sellPrice @ $rate" );
       $orderID = $exchange->sell( $coin, 'BTC', $rate, $sellAmount );
       if ( !is_null( $orderID ) ) {
@@ -738,6 +748,9 @@ class CoinManager {
           // Cancellation failed: Order has been executed!
           logg( "Order executed!" );
           Database::saveManagement( $coin, $sellAmount * -1, $rate, $exchange->getID() );
+
+          $arbitrator->getTradeMatcher()->handlePostTradeTasks( $arbitrator, $exchange, $coin, 'BTC', 'sell',
+                                                                $orderID, $sellAmount );
         }
       }
     }

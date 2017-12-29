@@ -33,9 +33,15 @@ function endsWith( $haystack, $needle ) {
 
 }
 
-function logg( $message, $mail = false ) {
+function alert( $type, $message ) {
 
-  Database::log( $message );
+  database::insertAlert( $type, $message );
+
+}
+
+function logg( $message ) {
+
+  database::log( $message );
 
   global $gVerbose;
 
@@ -43,6 +49,18 @@ function logg( $message, $mail = false ) {
     echo date( "H:i:s" ) . ": " . $message . "\n";
   }
 
+}
+
+function generateNewTradesLikeClause( $str ) {
+  return "raw_trade_ID LIKE \"%$str%\"";
+}
+
+function compareByTime( $row1, $row2 ) {
+  return $row1[ 'time' ] - $row2[ 'time' ];
+}
+
+function sumOfAmount( $carry, $item ) {
+  return $carry + $item[ 'amount' ];
 }
 
 function installDirectoryDirty() {

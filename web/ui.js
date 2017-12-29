@@ -5,6 +5,7 @@ var graphCoin = "BTC";
 var stats = null;
 var statsTimeout = null;
 var totalPL = null;
+var realizedPL = null;
 var profitableTrades = null;
 var plMode = "details";
 var uiDisabled = false;
@@ -24,6 +25,14 @@ $(function() {
         graphMode = mode;
         graphExchange = exid;
         graphCoin = coin;
+
+        updateGraph();
+        return false;
+    });
+
+    $(document).on("change", "#smooth", function() {
+        var smooth = $("#smooth")[0].checked;
+        Cookies.set('smooth', smooth);
 
         updateGraph();
         return false;
@@ -51,6 +60,13 @@ $(function() {
         updatePL();
         return false;
     });
+
+    function initSmoothCheckbox() {
+      var smoothCookie = Cookies.get('smooth');
+      if (smoothCookie == 'true') {
+        $("#smooth")[0].checked = true;
+      }
+    }
 
     function onHideZeroChange() {
         var checked = $('#hidezero')[0].checked;
@@ -144,9 +160,10 @@ $(function() {
             success: function(data) {
 
                 var obj = {};
+                var smooth = $("#smooth")[0].checked;
 
                 for (var x = 0; x < data[0].length; x++) {
-                    var d1 = [data[0][x].time * 1000, data[0][x].value];
+                    var d1 = [data[0][x].time * 1000, smooth ? data[0][x].value : data[0][x].raw];
                     var exchange = data[0][x].exchange;
                     if (exchange === undefined) {
                         continue;
@@ -161,7 +178,7 @@ $(function() {
                         if (!obj[0]) {
                             obj[0] = [];
                         }
-                        obj[0].push([data[1][x].time * 1000, data[1][x].value]);
+                        obj[0].push([data[1][x].time * 1000, smooth ? data[1][x].value : data[1][x].raw]);
                     }
                 }
 
@@ -199,6 +216,8 @@ $(function() {
                     },
                     xaxis: {
                         mode: "time",
+                        timeformat: "%b %e\n%H:%M",
+                        timezone: "browser",
                         min: startDate.getTime(),
                         max: endDate.getTime()
                     }
@@ -281,6 +300,7 @@ $(function() {
             success: function(data) {
 
                 totalPL = rnd4(data.pl) + data.pl_currency;
+                realizedPL = rnd4(data.realized_pl) + data.pl_currency;
                 profitableTrades = data.efficiency;
 
                 var arr = data.data;
@@ -876,6 +896,9 @@ $(function() {
         if (totalPL != null) {
             htmlData += "   Unrealized P&L: " + totalPL + "\n";
         }
+        if (realizedPL != null) {
+            htmlData += "     Realized P&L: " + realizedPL + "\n";
+        }
         if (profitableTrades != null) {
             htmlData += "Profitable trades: " + rnd2(profitableTrades) + "%\n";
         }
@@ -1103,6 +1126,8 @@ $(function() {
           },
       });
     }
+
+    initSmoothCheckbox();
 
     refreshStats();
     updateStats();

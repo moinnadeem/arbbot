@@ -13,6 +13,8 @@ class Poloniex extends Exchange {
   private $depositAddresses;
   private $tradeFee = 0.0025;
 
+  private $fullOrderHistory = null;
+
   function __construct() {
     parent::__construct( Config::get( "poloniex.key" ), Config::get( "poloniex.secret" ) );
 
@@ -26,7 +28,7 @@ class Poloniex extends Exchange {
 
   public function deductFeeFromAmountBuy( $amount ) {
 
-    return parent::deductFeeFromAmountBuy( $amount );
+    return $amount * (1 - $this->tradeFee);
 
   }
 
@@ -65,6 +67,13 @@ class Poloniex extends Exchange {
     catch ( Exception $ex ) {
       if ( strpos( $ex->getMessage(), 'frozen' ) !== false ) {
         logg( $this->prefix() . "Withdrawals for $amount are frozen, retrying later..." );
+        return false;
+      }
+      if ( strpos( $ex->getMessage(), 'daily withdrawal limit' ) !== false ) {
+        $alert = str_replace( 'API error response: ', '', $ex->getMessage() );
+        $alert .= sprintf( "\nHappened while withdrawing %s %s to the following address: %s.",
+                           formatBTC( $amount ), $coin, $address );
+        alert( 'poloniex-withdrawal-limit', $alert );
         return false;
       }
       throw $ex;
@@ -131,6 +140,183 @@ class Poloniex extends Exchange {
     return null;
   }
 
+  public function queryTradeHistory( $options = array( ), $recentOnly = false ) {
+    $results = array( );
+
+    if (!$recentOnly && $this->fullOrderHistory !== null) {
+      $results = $this->fullOrderHistory;
+    } else if (!$recentOnly && !$this->fullOrderHistory &&
+               file_exists( __DIR__ . '/../../poloniex-tradeHistory.csv' )) {
+      $file = file_get_contents( __DIR__ . '/../../poloniex-tradeHistory.csv' );
+      $lines = explode( "\n", $file );
+      $first = true;
+      foreach ($lines as $line) {
+        if ($first) {
+          // Ignore the first line.
+          $first = false;
+          continue;
+        }
+        $data = str_getcsv( $line );
+        if (count( $data ) != 11) {
+          continue;
+        }
+        $market = $data[ 1 ];
+        $arr = explode( '/', $market );
+        $currency = $arr[ 1 ];
+        $tradeable = $arr[ 0 ];
+        $market = "${currency}_${tradeable}";
+        $feeFactor = ($data[ 3 ] == 'Sell') ? -1 : 1;
+        $results[ $market ][] = array(
+          'rawID' => $data[ 8 ],
+          'id' => $currency . '_' . $tradeable . ':' . $data[ 8 ],
+          'currency' => $currency,
+          'tradeable' => $tradeable,
+          'type' => strtolower( $data[ 3 ] ),
+          'time' => strtotime( $data[ 0 ] ),
+          'rate' => floatval( $data[ 4 ] ),
+          'amount' => floatval( $data[ 5 ] ),
+          'fee' => floatval( $data[ 6 ] ) * ($feeFactor * floatval( $data[ 7 ] )),
+          'total' => floatval( $data[ 6 ] ),
+        );
+      }
+      $this->fullOrderHistory = $results;
+    }
+
+    if (!in_array( 'currencyPair', $options )) {
+      $options[ 'currencyPair' ] = 'all';
+    }
+    $history = $this->queryAPI( 'returnTradeHistory', $options );
+
+    $checkArray = !empty( $results );
+
+    $idsSeen = array( );
+
+    foreach (array_keys($history) as $market) {
+      $arr = explode( '_', $market );
+      $currency = $arr[ 0 ];
+      $tradeable = $arr[ 1 ];
+      foreach ($history[ $market ] as $row) {
+	if ( isset( $idsSeen[ $row[ 'orderNumber' ] ] ) ) {
+	  // Poloniex sometimes returns duplicate results!
+	  continue;
+	}
+	$idsSeen[ $row[ 'orderNumber' ] ] = true;
+
+        if (!in_array( $market, array_keys( $results ) )) {
+          $results[ $market ] = array();
+        }
+        $feeFactor = ($row[ 'type' ] == 'sell') ? -1 : 1;
+
+        if ($checkArray) {
+          $seen = false;
+          foreach ($results[ $market ] as $item) {
+            if ($item[ 'rawID' ] == $row[ 'orderNumber' ]) {
+              // We have already recorder this ID.
+              $seen = true;
+              break;
+            }
+          }
+          if ($seen) {
+            continue;
+          }
+        }
+
+        $results[ $market ][] = array(
+          'rawID' => $row[ 'orderNumber' ],
+          'id' => $currency . '_' . $tradeable . ':' . $row[ 'orderNumber' ],
+          'currency' => $currency,
+          'tradeable' => $tradeable,
+          'type' => $row[ 'type' ],
+          'time' => strtotime( $row[ 'date' ] ),
+          'rate' => floatval( $row[ 'rate' ] ),
+          'amount' => floatval( $row[ 'amount' ] ),
+          'fee' => floatval( $row[ 'total' ] ) * ($feeFactor * floatval( $row[ 'fee' ] )),
+          'total' => floatval( $row[ 'total' ] ),
+        );
+      }
+    }
+
+    foreach ( array_keys( $results ) as $market ) {
+      usort( $results[ $market ], 'compareByTime' );
+    }
+
+    return $results;
+  }
+
+  public function getRecentOrderTrades( &$arbitrator, $tradeable, $currency, $type, $orderID, $tradeAmount ) {
+
+    if (!preg_match( '/^[A-Z0-9_]+:(.*)$/', $orderID, $matches )) {
+      throw new Exception( $this->prefix() . "Invalid order id: " . $orderID );
+    }
+    $rawOrderID = $matches[ 1 ];
+    $results = $this->queryAPI( 'returnOrderTrades', array(
+      'orderNumber' => $rawOrderID,
+    ) );
+
+    $trades = array( );
+    $feeFactor = ($type == 'sell') ? -1 : 1;
+    foreach ( $results as $row ) {
+      $trades[] = array(
+        'rawID' => $rawOrderID . '/' . $row[ 'globalTradeID' ] . '/' . $row[ 'tradeID' ],
+        'id' => $orderID,
+        'currency' => $currency,
+        'tradeable' => $tradeable,
+        'type' => $type,
+        'time' => strtotime( $row[ 'date' ] ),
+        'rate' => floatval( $row[ 'rate' ] ),
+        'amount' => floatval( $row[ 'amount' ] ),
+        'fee' => floatval( $row[ 'total' ] ) * ($feeFactor * floatval( $row[ 'fee' ] )),
+        'total' => floatval( $row[ 'total' ] ),
+      );
+    }
+
+    return $trades;
+
+  }
+
+  private function queryRecentTransfers( $type, $currency ) {
+
+    $now = time();
+    $history = $this->queryAPI( 'returnDepositsWithdrawals', array(
+      'start' => $now - 30 * 60,
+      'end' => $now,
+    ) );
+
+    $result = array();
+    foreach ( $history[ "${type}s" ] as $row ) {
+      if ( !is_null( $currency ) && $currency != $row[ 'currency' ] ) {
+        continue;
+      }
+
+      $result[] = array(
+        'currency' => $row[ 'currency' ],
+        'amount' => $row[ 'amount' ],
+        // deposits have txid, withdrawals have withdrawalNumber
+        'txid' => isset( $row[ 'txid' ] ) ? $row[ 'txid' ] : $row[ 'withdrawalNumber' ],
+        'address' => $row[ 'address' ],
+        'time' => $row[ 'timestamp' ],
+        'pending' => strpos( $row[ 'status' ], 'COMPLETE' ) !== false,
+      );
+    }
+
+    usort( $result, 'compareByTime' );
+
+    return $result;
+
+  }
+
+  public function queryRecentDeposits( $currency = null ) {
+
+    return $this->queryRecentTransfers( 'deposit', $currency );
+
+  }
+
+  public function queryRecentWithdrawals( $currency = null ) {
+
+    return $this->queryRecentTransfers( 'withdrawal', $currency );
+
+  }
+
   protected function fetchOrderbook( $tradeable, $currency ) {
 
     $orderbook = $this->queryOrderbook( $tradeable, $currency );
@@ -170,8 +356,6 @@ class Poloniex extends Exchange {
   }
 
   public function cancelOrder( $orderID ) {
-
-    logg( $this->prefix() . "Cancelling order $orderID" );
 
     $split = explode( ':', $orderID );
     $pair = $split[ 0 ];
@@ -280,7 +464,7 @@ class Poloniex extends Exchange {
         $status = strtoupper( $entry[ 'status' ] );
 
         if ( $timestamp < time() - 12 * 3600 && (substr( $status, 0, 8 ) != 'COMPLETE' || strpos( $status, 'ERROR' ) !== false) ) {
-          logg( $this->prefix() . "Stuck $key! Please investigate and open support ticket if neccessary!\n\n" . print_r( $entry, true ), true );
+          alert( 'stuck-transfer', $this->prefix() . "Stuck $key! Please investigate and open support ticket if neccessary!\n\n" . print_r( $entry, true ), true );
           $this->lastStuckReportTime[ $key ] = $timestamp;
         }
       }
@@ -352,6 +536,12 @@ class Poloniex extends Exchange {
   public function getName() {
 
     return "POLONIEX";
+
+  }
+
+  public function getTradeHistoryCSVName() {
+
+    return "poloniex-tradeHistory.csv";
 
   }
 
@@ -429,7 +619,7 @@ class Poloniex extends Exchange {
     return $this->queryAPI( 'returnFeeInfo' );
   }
 
-  private function queryAPI( $command, array $req = [ ] ) {
+  public function queryAPI( $command, array $req = [ ] ) {
 
     $key = $this->apiKey;
     $secret = $this->apiSecret;

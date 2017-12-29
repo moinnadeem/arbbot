@@ -113,6 +113,20 @@ class Database {
 
   }
 
+  public static function insertAlert( $type, $message ) {
+
+    $link = self::connect();
+
+    if ( !mysql_query( sprintf( "INSERT INTO alerts (type, message, created) VALUES ('%s', '%s', %d);",
+                                mysql_escape_string( $type ),
+                                mysql_escape_string( strip_tags( $message ) ), time() ), $link ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    mysql_close( $link );
+
+  }
+
   public static function log( $message ) {
 
     $link = self::connect();
@@ -432,6 +446,366 @@ class Database {
 
     return $results;
 
+  }
+
+  public static function getPL() {
+
+    $link = self::connect();
+
+    $result = mysql_query( "SELECT trade.created AS created, trade.coin AS coin, trade.currency AS currency, " .
+                           "       trade.amount AS amount, ID_exchange_source AS source, ID_exchange_target AS target, message " .
+                           "FROM trade, log WHERE message LIKE 'TRADE SUMMARY:\\nPAIR: %' AND trade.created = log.created " .
+                           "ORDER BY trade.created DESC", $link );
+    if ( !$result ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $results = array();
+    $data = array();
+    $total_pl = 0;
+    $pl_currency = '';
+    $profitables = 0;
+    while ( $row = mysql_fetch_assoc( $result ) ) {
+      $message = $row[ 'message' ];
+      if (!preg_match( '/^TRADE SUMMARY:\n(?:[^\n]+\n){3}\n(?:[^\n]+\n)\s*' .
+                       $row[ 'coin' ] . '[^\n]+?([0-9.]+)\n\s*' .
+                       $row[ 'currency' ] . '[^\n]+?(-?[0-9.]+)\n' .
+                       '\n(?:[^\n]+\n)\s*' . $row[ 'coin' ] . '[^\n]+?(-?[0-9.]+)\n\s*' .
+                       $row[ 'currency' ] . '[^\n]+?([0-9.]+)\n' .
+                       '\n(?:[^\n]+\n)\s*' . $row[ 'currency' ] . '[^\n]+?(-?[0-9.]+)\n' .
+                       '(?:[^\n]+\n){2}\n\(Transfer fee is ([0-9.]+)\)/',
+                       $message, $matches )) {
+        throw new Exception( "invalid log message encountered: " . $message );
+      }
+      $exchange = Exchange::createFromID( $row[ 'target' ] );
+      $price_sold = $matches[ 2 ] / $exchange->deductFeeFromAmountSell( $row[ 'amount' ] );
+      $tx_fee = $matches[ 6 ] * $price_sold;
+      $pl = $matches[ 4 ] - $tx_fee;
+      if ($pl > 0) {
+        $profitables++;
+      }
+      $total_pl += $pl;
+      if (empty( $pl_currency )) {
+        $pl_currency = $row[ 'currency' ];
+      } else if ($row[ 'currency' ] != $pl_currency) {
+        throw new Exception( "P&L currency changed from ${pl_currency} to ${row['currency']} unexpectedly." );
+      }
+      $data[] = [
+        'time' => $row[ 'created' ],
+        'coin' => $row[ 'coin' ],
+        'currency' => $row[ 'currency' ],
+        'amount_bought_tradeable' => floatval( $matches[ 1 ] ),
+        'amount_sold_tradeable' => abs( $matches[ 3 ] ),
+        'tradeable_bought' => floatval( $matches[ 1 ] ),
+        'tradeable_sold' => abs( $matches[ 3 ] ),
+        'currency_bought' => abs( $matches[ 2 ] ),
+        'currency_sold' => floatval( $matches[ 4 ] ),
+        'currency_revenue' => floatval( $matches[ 5 ] ),
+        'tx_fee_tradeable' => floatval( $matches[ 6 ] ),
+        'source_exchange' => $row[ 'source' ],
+        'target_exchange' => $row[ 'target' ],
+      ];
+    }
+
+    mysql_close( $link );
+
+    return $data;
+  }
+
+  public static function saveProfitLoss( $coin, $currency, $time, $sourceExchange, $targetExchange,
+                                         $rawTradeIDsBuy, $tradeIDsBuy, $rawTradeIDsSell, $tradeIDsSell,
+                                         $rateBuy, $rateSell, $tradeableBought, $tradeableSold,
+                                         $currencyBought, $currencySold, $currencyRevenue, $currencyProfitLoss,
+                                         $tradeableTransferFee, $currencyTransferFee, $buyFee, $sellFee ) {
+
+    $link = self::connect();
+    $query = sprintf( "INSERT INTO profit_loss (created, ID_exchange_source, ID_exchange_target, coin, " .
+                      "                         currency, raw_trade_IDs_buy, trade_IDs_buy, " .
+                      "                         raw_trade_IDs_sell, trade_IDs_sell, rate_buy, " .
+                      "                         rate_sell, tradeable_bought, tradeable_sold, " .
+                      "                         currency_bought, currency_sold, currency_revenue, currency_pl, " .
+                      "                         tradeable_tx_fee, currency_tx_fee, buy_fee, sell_fee) VALUES " .
+                      "  (%d, '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', " .
+                      "   '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s');",
+            $time, $sourceExchange, $targetExchange, $coin, $currency, $rawTradeIDsBuy, $tradeIDsBuy,
+            $rawTradeIDsSell, $tradeIDsSell, formatBTC( $rateBuy ), formatBTC( $rateSell ),
+            formatBTC( $tradeableBought ), formatBTC( $tradeableSold ), formatBTC( $currencyBought ),
+            formatBTC( $currencySold ), formatBTC( $currencyRevenue ), formatBTC( $currencyProfitLoss ),
+            formatBTC( $tradeableTransferFee ), formatBTC( $currencyTransferFee ), formatBTC( $buyFee ),
+            formatBTC( $sellFee ) );
+    if ( !mysql_query( $query, $link ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+    mysql_close( $link );
+
+  }
+
+  public static function saveExchangeTrade( $exchangeID, $type, $coin, $currency, $time, $rawTradeID, $tradeID,
+                                            $rate, $amount, $fee, $total ) {
+
+    $link = self::connect();
+    $query = sprintf( "REPLACE INTO exchange_trades (created, ID_exchange, coin, currency, " .
+                      "                              raw_trade_ID, trade_ID, rate, amount, " .
+                      "                              fee, total, type) VALUES " .
+                      "  (%d, '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s');",
+             $time, $exchangeID, $coin, $currency, $rawTradeID, $tradeID, formatBTC( $rate ), 
+             formatBTC( $amount ), formatBTC( $fee ), formatBTC( $total ), $type );
+    if ( !mysql_query( $query, $link ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+    mysql_close( $link );
+
+  }
+
+  public static function alertsTableExists() {
+
+    $link = self::connect();
+
+    if ( !mysql_query( sprintf( "SELECT * FROM information_schema.tables WHERE table_schema = '%s' " .
+                                "AND table_name = 'alerts' LIMIT 1;",
+                                mysql_escape_string( Config::get( Config::DB_NAME, null ) ) ), $link ) ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $rows = mysql_affected_rows( $link );
+    $result = $rows > 0;
+
+    mysql_close( $link );
+
+    return $result;
+
+  }
+
+  public static function createAlertsTable() {
+
+    $link = self::connect();
+
+    $query = file_get_contents( __DIR__ . '/../alerts.sql' );
+
+    foreach ( explode( ';', $query ) as $q ) {
+      $q = trim( $q );
+      if ( !strlen( $q ) ) {
+        continue;
+      }
+      if ( !mysql_query( $q, $link ) ) {
+        throw new Exception( "database insertion error: " . mysql_error( $link ) );
+      }
+    }
+
+    mysql_close( $link );
+
+    return true;
+
+  }
+
+  public static function importAlerts() {
+
+    $link = self::connect();
+
+    $result = mysql_query( "SELECT ID, created FROM log WHERE message = 'stuckDetection()' ORDER BY created ASC", $link );
+    if ( !$result ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    while ( $row = mysql_fetch_assoc( $result ) ) {
+      $id = $row[ 'ID' ];
+      // Poor man's progress bar
+      print strftime( "\rLooking at stuck withdrawal check performed on %Y-%m-%d %H:%M:%S", $row[ 'created' ] );
+
+      $result2 = mysql_query( "SELECT created, message FROM log WHERE ID > $id ORDER BY ID ASC", $link );
+      if ( !$result2 ) {
+	throw new Exception( "database selection error: " . mysql_error( $link ) );
+      }
+
+      while ( $row = mysql_fetch_assoc( $result2 ) ) {
+	if (!preg_match( '/Please investigate and open support ticket if neccessary/', $row[ 'message' ] )) {
+	  break;
+	}
+	$result3 = mysql_query( sprintf( "INSERT INTO alerts(type, created, message) " .
+                                         "VALUES ('stuck-transfer', %d, '%s');",
+                                         $row[ 'created' ],
+                                         mysql_escape_string( $row[ 'message' ] ) ),
+                                $link );
+	if ( !$result3 ) {
+	  throw new Exception( "database selection error: " . mysql_error( $link ) );
+	}
+      }
+    }
+
+    print "\n";
+
+    mysql_close( $link );
+
+  }
+
+  public static function profitsTableExists() {
+
+    $link = self::connect();
+
+    if ( !mysql_query( sprintf( "SELECT * FROM information_schema.tables WHERE table_schema = '%s' " .
+                                "AND table_name = 'profits' LIMIT 1;",
+                                mysql_escape_string( Config::get( Config::DB_NAME, null ) ) ), $link ) ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $rows = mysql_affected_rows( $link );
+    $result = $rows > 0;
+
+    mysql_close( $link );
+
+    return $result;
+
+  }
+
+  public static function createProfitsTable() {
+
+    $link = self::connect();
+
+    $query = file_get_contents( __DIR__ . '/../profits.sql' );
+
+    foreach ( explode( ';', $query ) as $q ) {
+      $q = trim( $q );
+      if ( !strlen( $q ) ) {
+        continue;
+      }
+      if ( !mysql_query( $q, $link ) ) {
+        throw new Exception( "database insertion error: " . mysql_error( $link ) );
+      }
+    }
+
+    mysql_close( $link );
+
+    return true;
+
+  }
+
+  public static function importProfits() {
+
+    $link = self::connect();
+
+    $result = mysql_query( "SELECT message, created FROM log WHERE message LIKE 'Withdrawing profit: %' ORDER BY created ASC", $link );
+    if ( !$result ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    while ( $row = mysql_fetch_assoc( $result ) ) {
+      if (!preg_match( '/^Withdrawing profit: ([0-9\.]+) BTC to (.*)$/',
+                       $row[ 'message' ], $matches )) {
+        break;
+      }
+      Database::recordProfit( $matches[ 1 ], 'BTC', $matches[ 2 ], $row[ 'created' ] );
+    }
+
+    mysql_close( $link );
+
+  }
+
+  public static function recordProfit( $amount, $currency, $address, $created ) {
+
+    $link = self::connect();
+    $percentRestock = Config::get( Config::TAKE_PROFIT_MIN_RESTOCK_CASH,
+                                   Config::DEFAULT_TAKE_PROFIT_MIN_RESTOCK_CASH );
+
+    if ( !mysql_query( sprintf( "INSERT INTO profits (created, currency, amount, cash_restock_percent, " .
+                                                      "cash_restock_amount, address) VALUES (%d, '%s', " .
+                                                      "'%s', '%s', '%s', '%s');",
+                                $created, mysql_escape_string( $currency ),
+                                formatBTC( $amount ),
+                                formatBTC( $percentRestock ),
+                                formatBTC( $percentRestock * $amount ),
+                                mysql_escape_string( $address ) ),
+                        $link ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    mysql_close( $link );
+
+  }
+
+  public static function profitLossTableExists() {
+
+    $link = self::connect();
+
+    if ( !mysql_query( sprintf( "SELECT * FROM information_schema.tables WHERE table_schema = '%s' " .
+                                "AND table_name = 'profit_loss' LIMIT 1;",
+                                mysql_escape_string( Config::get( Config::DB_NAME, null ) ) ), $link ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    $rows = mysql_affected_rows( $link );
+    $result = $rows > 0;
+
+    mysql_close( $link );
+
+    return $result;
+
+  }
+
+  public static function createProfitLossTable() {
+
+    $link = self::connect();
+
+    $query = file_get_contents( __DIR__ . '/../profit_loss.sql' );
+
+    foreach ( explode( ';', $query ) as $q ) {
+      $q = trim( $q );
+      if ( !strlen( $q ) ) {
+        continue;
+      }
+      if ( !mysql_query( $q, $link ) ) {
+        throw new Exception( "database insertion error: " . mysql_error( $link ) );
+      }
+    }
+
+    mysql_close( $link );
+
+    return true;
+
+  }
+
+  public static function getNewTrades( $recentTradeIDs ) {
+
+    $link = self::connect();
+
+    if ( !count( $recentTradeIDs ) ) {
+      return array( );
+    }
+
+    $arg = implode( " OR ", array_map( 'generateNewTradesLikeClause',
+                            array_map( 'mysql_escape_string', $recentTradeIDs ) ) );
+
+    if ( !$result = mysql_query( sprintf( "SELECT raw_trade_ID " .
+                                          "FROM exchange_trades WHERE %s;",
+                                          $arg ) ) ) {
+      throw new Exception( "database insertion error: " . mysql_error( $link ) );
+    }
+
+    $return = array( );
+    while ( $row = mysql_fetch_assoc( $result ) ) {
+      $return[ $row[ 'raw_trade_ID' ] ] = true;
+    }
+
+    mysql_close( $link );
+
+    $result = array( );
+    foreach ( $recentTradeIDs as $id ) {
+      if ( isset( $return[ $id ] ) ) {
+        continue;
+      }
+      // If we don't find an exact match, look for a partial match.
+      $add = true;
+      foreach ( array_keys( $return ) as $candidate ) {
+        if ( strpos( $candidate, $id ) !== false ) {
+          $add = false;
+          break;
+        }
+      }
+      if ( $add ) {
+        $result[] = $id;
+      }
+    }
+
+    return $result;
   }
 
 }

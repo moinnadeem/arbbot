@@ -65,9 +65,7 @@ class WebDB {
   public static function getAlerts() {
     $link = self::connect();
 
-    $query = "SELECT created, message FROM log WHERE ID > " .
-               "(SELECT ID FROM log WHERE message = 'stuckDetection()' ORDER BY created DESC LIMIT 1) " .
-             "ORDER BY ID ASC";
+    $query = "SELECT created, message FROM alerts WHERE created >= UNIX_TIMESTAMP() - 24 * 3600 ORDER BY ID ASC";
     $result = mysql_query( $query, $link );
     if ( !$result ) {
       throw new Exception( "database selection error: " . mysql_error( $link ) );
@@ -75,9 +73,6 @@ class WebDB {
 
     $results = [ ];
     while ( $row = mysql_fetch_assoc( $result ) ) {
-      if (!preg_match( '/Please investigate and open support ticket if neccessary/', $row[ 'message' ] )) {
-        break;
-      }
       $results[] = ['message' => $row[ 'message' ], 'time' => $row[ 'created' ] ];
     }
 
@@ -125,19 +120,19 @@ class WebDB {
     while ( $row = mysql_fetch_assoc( $result ) ) {
 
       $value = floatval( $row[ 'data' ] );
-      $exchange = $row[ 'ID_exchange' ];
+      $ex = $row[ 'ID_exchange' ];
 
-      if (!in_array( $exchange, $ma )) {
-        $ma[$exchange] = [ ];
+      if (!in_array( $ex, array_keys( $ma ) )) {
+        $ma[$ex] = [ ];
       }
-      $ma[$exchange][] = $value;
-      while ( count( $ma[$exchange] ) > 4 ) {
-        array_shift( $ma[$exchange] );
+      $ma[$ex][] = $value;
+      while ( count( $ma[$ex] ) > 4 ) {
+        array_shift( $ma[$ex] );
       }
 
-      $sma = array_sum( $ma[$exchange] ) / count( $ma[$exchange] );
+      $sma = array_sum( $ma[$ex] ) / count( $ma[$ex] );
       $data[] = ['time' => $row[ 'created' ], 'value' => $sma , 'raw' => $value,
-                 'exchange' => $exchange ];
+                 'exchange' => $ex ];
     }
 
     mysql_close( $link );
@@ -158,6 +153,9 @@ class WebDB {
         // Will be 0 if $coin doesn't exist in our wallets!
         $balance = @floatval( $wallets[ $coin ] );
 
+	if (!in_array( $id, array_keys( $ma ) )) {
+	  $ma[$id] = [ ];
+	}
 	$ma[$id][] = $balance;
 	while ( count( $ma[$id] ) > 4 ) {
 	  array_shift( $ma[$id] );
@@ -483,62 +481,64 @@ class WebDB {
 
     $link = self::connect();
 
-    $result = mysql_query( "SELECT trade.created AS created, trade.coin AS coin, trade.currency AS currency, " .
-                           "       trade.amount AS amount, ID_exchange_source AS source, ID_exchange_target AS target, message " .
-                           "FROM trade, log WHERE message LIKE 'TRADE SUMMARY:\\nPAIR: %' AND trade.created = log.created " .
-                           "ORDER BY trade.created DESC", $link );
+    $result = mysql_query( "SELECT created, coin, currency, tradeable_sold AS amount, currency_bought, " .
+                           "       currency_sold, currency_revenue, currency_pl, currency_tx_fee, " .
+                           "       tradeable_tx_fee, ID_exchange_source AS source, " .
+                           "       ID_exchange_target AS target " .
+                           "FROM profit_loss " .
+                           "ORDER BY created DESC", $link );
     if ( !$result ) {
       throw new Exception( "database selection error: " . mysql_error( $link ) );
     }
 
     $results = array();
     $data = array();
-    $total_pl = 0;
     $pl_currency = '';
     $profitables = 0;
     while ( $row = mysql_fetch_assoc( $result ) ) {
-      $message = $row[ 'message' ];
-      if (!preg_match( '/^TRADE SUMMARY:\n(?:[^\n]+\n){3}\n(?:[^\n]+\n){2}\s*' .
-                       $row[ 'currency' ] . '[^\n]+?(-?[0-9.]+)\n' .
-                       '\n(?:[^\n]+\n){2}\s*' . $row[ 'currency' ] . '[^\n]+?(-?[0-9.]+)\n' .
-                       '\n(?:[^\n]+\n)\s*' . $row[ 'currency' ] . '[^\n]+?(-?[0-9.]+)\n' .
-                       '(?:[^\n]+\n){2}\n\(Transfer fee is (-?[0-9.]+)\)/',
-                       $message, $matches )) {
-        throw new Exception( "invalid log message encountered: " . $message );
-      }
-      $exchange = Exchange::createFromID( $row[ 'target' ] );
-      $price_sold = $matches[ 2 ] / $exchange->deductFeeFromAmountSell( $row[ 'amount' ] );
-      $tx_fee = $matches[ 4 ] * $price_sold;
-      $pl = $matches[ 3 ] - $tx_fee;
-      if ($pl > 0) {
+      $pl_currency = $row[ 'currency' ];
+      if ($row[ 'currency_pl' ] > 0) {
         $profitables++;
-      }
-      $total_pl += $pl;
-      if (empty( $pl_currency )) {
-        $pl_currency = $row[ 'currency' ];
-      } else if ($row[ 'currency' ] != $pl_currency) {
-        throw new Exception( "P&L currency changed from ${pl_currency} to ${row['currency']} unexpectedly." );
       }
       $data[] = [
         'time' => $row[ 'created' ],
         'coin' => $row[ 'coin' ],
         'currency' => $row[ 'currency' ],
-        'amount_sold' => $row[ 'amount' ],
-        'currency_bought' => $matches[ 1 ],
-        'currency_sold' => $matches[ 2 ],
-        'currency_revenue' => $matches[ 3 ],
-        'currency_pl' => $pl,
-        'currency_tx_fee' => $tx_fee,
-        'tx_fee' => $matches[ 4 ],
+        'amount_sold' => floatval( $row[ 'amount' ] ),
+        'currency_bought' => floatval( $row[ 'currency_bought' ] ),
+        'currency_sold' => floatval( $row[ 'currency_sold' ] ),
+        'currency_revenue' => floatval( $row[ 'currency_revenue' ] ),
+        'currency_pl' => floatval( $row[ 'currency_pl' ] ),
+        'currency_tx_fee' => floatval( $row[ 'currency_tx_fee' ] ),
+        'tx_fee' => floatval( $row[ 'tradeable_tx_fee' ] ),
         'source_exchange' => $row[ 'source' ],
         'target_exchange' => $row[ 'target' ],
       ];
     }
 
+    $result = mysql_query( "SELECT SUM(currency_pl) AS total_pl " .
+                           "FROM profit_loss;", $link );
+    if ( !$result ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $row = mysql_fetch_assoc( $result );
+    $total_pl = $row[ 'total_pl' ];
+
+    $result = mysql_query( "SELECT SUM(amount) AS realized_pl " .
+                           "FROM profits;", $link );
+    if ( !$result ) {
+      throw new Exception( "database selection error: " . mysql_error( $link ) );
+    }
+
+    $row = mysql_fetch_assoc( $result );
+    $realized_pl = $row[ 'realized_pl' ];
+
     mysql_close( $link );
 
     $results = [
       'pl' => $total_pl,
+      'realized_pl' => $realized_pl,
       'pl_currency' => $pl_currency,
       'efficiency' => count( $data ) ? 100 * $profitables / count( $data ) : 0,
       'data' => $data,

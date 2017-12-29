@@ -4,26 +4,47 @@ require_once __DIR__ . '/CoinManager.php';
 
 class Arbitrator {
 
+  private $eventLoop;
+  private $errorCounter;
   private $exchanges;
   private $exchangePairs = [ ];
   //
   private $coinManager;
+  private $tradeMatcher;
   //
   private $nextCoinUpdate = 0;
   private $walletsRefreshed = false;
   private $tradeHappened = false;
+  //
+  private $lastRecentDeposits = [ ];
+  private $lastRecentWithdrawals = [ ];
 
-  function __construct( $exchanges ) {
-    $this->exchanges = $exchanges;
+  function __construct( $loop, $exchanges, &$tradeMatcher ) {
+    $this->eventLoop = $loop;
+    $self = $this;
+    $this->eventLoop->addTimer( 1, function() use($self) {
+      $self->innerRun();
+    } );
+
+    $this->exchanges = &$exchanges;
+    $this->tradeMatcher = &$tradeMatcher;
 
     // Create a list containing the exchange pairs:
     for ( $i = 0; $i < count( $exchanges ); $i++ ) {
       for ( $j = $i + 1; $j < count( $exchanges ); $j++ ) {
         $this->exchangePairs[] = [$exchanges[ $i ], $exchanges[ $j ] ];
       }
+      $this->lastRecentDeposits[ $exchanges[ $i ]->getID() ] = array( );
+      $this->lastRecentWithdrawals[ $exchanges[ $i ]->getID() ] = array( );
     }
 
     $this->coinManager = new CoinManager( $exchanges );
+
+  }
+
+  public function getEventLoop() {
+
+    return $this->eventLoop;
 
   }
 
@@ -41,7 +62,7 @@ class Arbitrator {
 
     $this->refreshWallets();
 
-    if ( $this->coinManager->doManage() ) {
+    if ( $this->coinManager->doManage( $this ) ) {
       return;
     }
 
@@ -289,6 +310,7 @@ class Arbitrator {
     logg( $orderInfo );
 
     $sellOrderID = $target->sell( $tradeable, $currency, $reducedSellRate, $sellAmount );
+    $buyOrderID = null;
     if ( is_null( $sellOrderID ) ) {
       logg( "Sell order failed, we will not attempt a buy order to avoid incurring a loss." );
       $buyOrderID = null;
@@ -319,37 +341,52 @@ class Arbitrator {
       }
     }
 
+    if ( is_null( $buyOrderID ) && is_null( $sellOrderID ) ) {
+      // Sell order failed, we're bailing out!
+      return false;
+    }
+
     for ( $i = 1; $i <= 8; $i *= 2 ) {
 
       logg( "Checking trade results ($i)..." );
 
-      $target->refreshWallets();
       $source->refreshWallets();
+      $target->refreshWallets();
+
+      $buyTrades = $this->tradeMatcher->handlePostTradeTasks( $this, $source, $tradeable, $currency, 'buy',
+                                                              $buyOrderID, $tradeAmount );
+      $sellTrades = $this->tradeMatcher->handlePostTradeTasks( $this, $target, $tradeable, $currency, 'sell',
+                                                               $sellOrderID, $sellAmount );
 
       $totalCost = is_null( $buyOrderID ) ? 0 :
                      $source->getFilledOrderPrice( 'buy', $tradeable, $currency, $buyOrderID );
       $totalRevenue = is_null( $sellOrderID ) ? 0 :
                         $target->getFilledOrderPrice( 'sell', $tradeable, $currency, $sellOrderID );
 
-      $sourceTradeableAfter = $source->getWallets()[ $tradeable ];
-      $targetTradeableAfter = $target->getWallets()[ $tradeable ];
+      $currencyProfitLoss = $this->tradeMatcher->saveProfitLoss( $source, $target,
+                                                                 $buyTrades, $sellTrades,
+                                                                 $this->coinManager );
 
       $sourceCurrencyAfter = $sourceCurrencyBefore - $totalCost;
       $targetCurrencyAfter = $targetCurrencyBefore + $totalRevenue;
+
+      $sourceTradeableAfter = $source->getWallets()[ $tradeable ];
+      $targetTradeableAfter = $target->getWallets()[ $tradeable ];
+
+      $sourceTradeableDifference = $sourceTradeableAfter - $sourceTradeableBefore;
+      $targetTradeableDifference = $targetTradeableAfter - $targetTradeableBefore;
 
       $message = "TRADE SUMMARY:\n";
       $message .= "PAIR: $tradeable vs $currency\n";
       $message .= "DIRECTION: " . $source->getName() . " TO " . $target->getName() . "\n";
       $message .= "BALANCES BEFORE / AFTER\n";
       $message .= "\n" . $source->getName() . ":\n";
-      $sourceTradeableDifference = $sourceTradeableAfter - $sourceTradeableBefore;
       $message .= formatCoin( $tradeable ) . ": " . formatBalance( $sourceTradeableBefore ) . " => " . formatBalance( $sourceTradeableAfter ) . " = " . formatBalance( $sourceTradeableDifference ) . "\n";
 
       $sourceCurrencyDifference = $sourceCurrencyAfter - $sourceCurrencyBefore;
       $message .= formatCoin( $currency ) . ": " . formatBalance( $sourceCurrencyBefore ) . " => " . formatBalance( $sourceCurrencyAfter ) . " = " . formatBalance( $sourceCurrencyDifference ) . "\n";
 
       $message .= "\n" . $target->getName() . ":\n";
-      $targetTradeableDifference = $targetTradeableAfter - $targetTradeableBefore;
       $message .= formatCoin( $tradeable ) . ": " . formatBalance( $targetTradeableBefore ) . " => " . formatBalance( $targetTradeableAfter ) . " = " . formatBalance( $targetTradeableDifference ) . "\n";
 
       $targetCurrencyDifference = $targetCurrencyAfter - $targetCurrencyBefore;
@@ -367,6 +404,8 @@ class Arbitrator {
       $message .= "(Transfer fee is " . formatBTC( $txFee ) . ")\n\n";
 
       logg( $message );
+
+      logg( sprintf( "Calculated P&L: %.8f", formatBTC( $currencyProfitLoss) ) );
 
       Database::saveTrade( $tradeable, $currency, $sellAmount, $source->getID(), $target->getID() );
 
@@ -439,6 +478,10 @@ class Arbitrator {
     logg( "Refreshing wallets..." );
     foreach ( $this->exchanges as $exchange ) {
       $exchange->refreshWallets();
+      if ($this->walletsRefreshed) {
+        $this->lastRecentDeposits[ $exchange->getID() ] = $exchange->queryRecentDeposits();
+        $this->lastRecentWithdrawals[ $exchange->getID() ] = $exchange->queryRecentWithdrawals();
+      }
     }
 
     $this->walletsRefreshed = true;
@@ -447,20 +490,45 @@ class Arbitrator {
 
   public function run() {
 
-    $errorCounter = 0;
+    $this->errorCounter = 0;
 
-    while ( true ) {
+    $this->eventLoop->run();
 
-      try {
-        $this->loop();
-        $errorCounter = 0;
-      }
-      catch ( Exception $ex ) {
-        $errorCounter++;
-        logg( "Error during main loop: " . $ex->getMessage() . "\n" . $ex->getTraceAsString(), $errorCounter == 10 );
-        sleep( 1 );
-      }
+  }
+
+  private function innerRun() {
+
+    try {
+      $this->loop();
+      $this->errorCounter = 0;
     }
+    catch ( Exception $ex ) {
+      $this->errorCounter++;
+      logg( "Error during main loop: " . $ex->getMessage() . "\n" . $ex->getTraceAsString(), $this->errorCounter == 10 );
+    }
+
+    $self = $this;
+    $this->eventLoop->addTimer( 1, function() use($self) {
+      $self->innerRun();
+    } );
+
+  }
+
+  public function getLastRecentDeposits() {
+
+    return $this->lastRecentDeposits;
+
+  }
+
+  public function getLastRecentWithdrawals() {
+
+    return $this->lastRecentWithdrawals;
+
+  }
+
+  public function getTradeMatcher() {
+
+    return $this->tradeMatcher;
 
   }
 
